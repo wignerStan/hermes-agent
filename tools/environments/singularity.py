@@ -153,6 +153,85 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
             return image
 
 
+def _build_underlay_flags() -> list[str]:
+    """Build apptainer exec flags for HPC underlay mode (kernel 3.10).
+
+    Replicates the bind-mount pattern from cal-bashrc:
+    HOME, container-data, container-bin, /tmp, proxy stack, HPC dirs,
+    SLURM libs, Homebrew, passwd, ZDOTDIR.
+    Activated by HERMES_SINGULARITY_HPC_MODE=underlay env var.
+    """
+    flags = ["--underlay"]
+    home = os.getenv("HOME", "")
+    if home:
+        flags.extend(["--bind", home, "--home", home])
+    sdata = os.path.join(home, "container-data")
+    if os.path.isdir(sdata):
+        flags.extend(["--bind", f"{sdata}:/opt/container-data"])
+    sbin = os.path.join(home, "container-bin")
+    if os.path.isdir(sbin):
+        flags.extend(["--bind", f"{sbin}:/opt/container-bin"])
+    flags.extend(["--bind", "/tmp:/tmp"])
+
+    # Proxy stack: inject LD_PRELOAD into container for transparent SOCKS5
+    proxy_dir = os.path.join(home, ".proxy-stack")
+    pc_so = os.path.join(proxy_dir, "libproxychains4-rust.so")
+    pr_so = os.path.join(proxy_dir, "libproxy-resolve.so")
+    # Config lookup: check proxy-stack dir first (vscode-tunnel pattern),
+    # then legacy home dir path. Skip injection entirely if no config found.
+    conf = ""
+    for _c in (
+        os.path.join(proxy_dir, "proxychains4.conf"),
+        os.path.join(home, ".proxychains4-rust.conf"),
+    ):
+        if os.path.isfile(_c):
+            conf = _c
+            break
+    if os.path.isfile(pc_so) and conf:
+        preload_parts = ["/opt/pr/libproxychains4-rust.so"]
+        if os.path.isfile(pr_so):
+            preload_parts.append("/opt/pr/libproxy-resolve.so")
+        flags.extend(["--bind", f"{proxy_dir}:/opt/pr"])
+        flags.extend(["--env", f"LD_PRELOAD={':'.join(preload_parts)}"])
+        flags.extend(["--env", "LD_LIBRARY_PATH=/opt/pr"])
+        flags.extend(["--bind", f"{conf}:/opt/pr/proxychains4.conf"])
+        flags.extend(["--env", "PROXYCHAINS_CONF_FILE=/opt/pr/proxychains4.conf"])
+
+    # HPC directories (SLURM, gridview) — auto-detect
+    for d in ("/opt/gridview", "/opt/hpc/software",
+              "/public/slurm_share", "/public/software"):
+        if os.path.isdir(d):
+            flags.extend(["--bind", f"{d}:{d}"])
+
+    # SLURM .so + munge socket
+    slurm_libs = os.path.join(sdata, "slurm-libs")
+    if os.path.isdir(slurm_libs):
+        for f in ("liblua-5.1.so", "libjson-c.so.2"):
+            p = os.path.join(slurm_libs, f)
+            if os.path.isfile(p):
+                flags.extend(["--bind", f"{p}:/lib64/{f}"])
+    munge_sock = "/opt/gridview/munge/run/munge/munge.socket.2"
+    if os.path.exists(munge_sock):
+        flags.extend(["--bind", f"{munge_sock}:/run/munge/munge.socket.2"])
+
+    # Homebrew bind mounts (underlay: rootfs read-only)
+    hb = os.path.join(sdata, "homebrew")
+    for sub in ("bin", "lib", "etc"):
+        sub_path = os.path.join(hb, sub)
+        if os.path.isdir(sub_path):
+            flags.extend(["--bind", f"{sub_path}:/home/linuxbrew/.linuxbrew/{sub}"])
+
+    # Fixed passwd
+    passwd = os.path.join(proxy_dir, "etc-passwd")
+    if os.path.isfile(passwd):
+        flags.extend(["--bind", f"{passwd}:/etc/passwd"])
+
+    # ZDOTDIR for container zsh config isolation
+    flags.extend(["--env", "ZDOTDIR=/opt/container-data/zsh"])
+
+    return flags
+
+
 class SingularityEnvironment(BaseEnvironment):
     """Hardened Singularity/Apptainer container with resource limits and persistence.
 
@@ -193,6 +272,13 @@ class SingularityEnvironment(BaseEnvironment):
         self.init_session()
 
     def _start_instance(self):
+        # HPC underlay mode: per-command exec, no persistent instance
+        if os.getenv("HERMES_SINGULARITY_HPC_MODE", "") == "underlay":
+            self._underlay_flags = _build_underlay_flags()
+            self._instance_started = True
+            logger.info("Singularity underlay mode (per-command exec)")
+            return
+
         cmd = [self.executable, "instance", "start"]
         cmd.extend(["--containall", "--no-home"])
 
@@ -231,6 +317,15 @@ class SingularityEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Singularity instance."""
+        # HPC underlay mode: per-command apptainer exec --underlay
+        if getattr(self, '_underlay_flags', None):
+            cmd = [self.executable, "exec"] + self._underlay_flags + [str(self.image)]
+            if login:
+                cmd.extend(["bash", "-l", "-c", cmd_string])
+            else:
+                cmd.extend(["bash", "-c", cmd_string])
+            return _popen_bash(cmd, stdin_data)
+
         if not self._instance_started:
             raise RuntimeError("Singularity instance not started")
 
@@ -245,6 +340,9 @@ class SingularityEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Stop the instance. If persistent, the overlay dir survives."""
+        if getattr(self, '_underlay_flags', None):
+            return  # No instance to stop in underlay mode
+
         if self._instance_started:
             try:
                 subprocess.run(
