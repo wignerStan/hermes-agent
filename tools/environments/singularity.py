@@ -316,14 +316,12 @@ class SingularityEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
-        """Spawn a bash process inside the Singularity instance."""
+        """Spawn a shell process inside the Singularity instance."""
         # HPC underlay mode: per-command apptainer exec --underlay
+        # Non-interactive zsh: only sources $ZDOTDIR/.zshenv (PATH, mirrors, etc.)
         if getattr(self, '_underlay_flags', None):
             cmd = [self.executable, "exec"] + self._underlay_flags + [str(self.image)]
-            if login:
-                cmd.extend(["bash", "-l", "-c", cmd_string])
-            else:
-                cmd.extend(["bash", "-c", cmd_string])
+            cmd.extend(["zsh", "-c", cmd_string])
             return _popen_bash(cmd, stdin_data)
 
         if not self._instance_started:
