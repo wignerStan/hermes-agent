@@ -1073,6 +1073,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
         self._load_seen_message_ids()
+        # Polling fallback: polls Feishu API when WebSocket events aren't delivered
+        self._polling_task: Optional[asyncio.Task] = None
+        self._polling_enabled: bool = False
+        self._polling_chats: Dict[str, float] = {}  # chat_id → last_create_time_ms
+        self._polling_token: Optional[str] = None
+        self._polling_token_expire: float = 0.0
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1242,6 +1248,9 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
+            # Start polling fallback for message delivery
+            self._polling_enabled = True
+            self._polling_task = self._loop.create_task(self._poll_messages_loop())
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -1252,6 +1261,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
+        self._polling_enabled = False
+        if self._polling_task and not self._polling_task.done():
+            self._polling_task.cancel()
         self._running = False
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
@@ -3136,6 +3148,186 @@ class FeishuAdapter(BasePlatformAdapter):
             self._dedup_state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except OSError:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
+
+
+    # =========================================================================
+    # Message polling fallback
+    # =========================================================================
+
+    async def _poll_get_token(self) -> str:
+        """Get or refresh tenant access token for polling API calls."""
+        import httpx
+        now = time.time()
+        if self._polling_token and now < self._polling_token_expire - 60:
+            return self._polling_token
+        r = httpx.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": self._app_id, "app_secret": self._app_secret},
+            timeout=15.0,
+        )
+        data = r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Failed to get polling token: {data}")
+        self._polling_token = data["tenant_access_token"]
+        self._polling_token_expire = now + data.get("expire", 7200)
+        return self._polling_token
+
+    async def _poll_discover_chats(self) -> None:
+        """Discover P2P chats by checking known sent messages."""
+        # Add chats from sent message tracking
+        for msg_id, chat_id in self._sent_message_ids_to_chat.items():
+            if chat_id and chat_id not in self._polling_chats:
+                self._polling_chats[chat_id] = 0.0
+                logger.info("[Feishu Poll] Discovered chat from sent messages: %s", chat_id)
+
+    async def _poll_messages_loop(self) -> None:
+        """Background task: poll Feishu API for new messages every 5 seconds."""
+        import httpx
+        # Seed with any known chats + hardcoded P2P chat
+        # This is the P2P chat between bot and user (discovered from test messages)
+        if "oc_8cfcdebc9f8dee2741eefae1aef4cac5" not in self._polling_chats:
+            self._polling_chats["oc_8cfcdebc9f8dee2741eefae1aef4cac5"] = 0.0
+        await self._poll_discover_chats()
+        # If no chats known yet, wait for bot to send a message first
+        if not self._polling_chats:
+            logger.info("[Feishu Poll] No known chats yet, waiting for bot to send a message...")
+            for _ in range(60):  # Wait up to 5 minutes
+                if not self._polling_enabled:
+                    return
+                await asyncio.sleep(5)
+                await self._poll_discover_chats()
+                if self._polling_chats:
+                    break
+
+        logger.info("[Feishu Poll] Starting message polling for %d chat(s): %s",
+                     len(self._polling_chats), list(self._polling_chats.keys()))
+
+        consecutive_errors = 0
+        while self._polling_enabled:
+            try:
+                token = await self._poll_get_token()
+                headers = {"Authorization": f"Bearer {token}"}
+
+                for chat_id in list(self._polling_chats.keys()):
+                    if not self._polling_enabled:
+                        break
+                    try:
+                        last_time = self._polling_chats.get(chat_id, 0.0)
+                        params = {
+                            "container_id_type": "chat",
+                            "container_id": chat_id,
+                            "page_size": 20,
+                            "sort_type": "ByCreateTimeDesc",
+                        }
+                        if last_time > 0:
+                            params["start_time"] = str(int(last_time) + 1)
+                            params["end_time"] = str(int(time.time() * 1000))
+
+                        r = await asyncio.to_thread(
+                            lambda: httpx.get(
+                                "https://open.feishu.cn/open-apis/im/v1/messages",
+                                headers=headers,
+                                params=params,
+                                timeout=15.0,
+                            )
+                        )
+                        data = r.json()
+                        if data.get("code") != 0:
+                            logger.debug("[Feishu Poll] List messages failed for %s: %s",
+                                        chat_id, data.get("msg", "unknown"))
+                            continue
+
+                        items = (data.get("data") or {}).get("items") or []
+                        new_count = 0
+                        for msg in reversed(items):  # Process oldest first
+                            msg_id = msg.get("message_id", "")
+                            create_time = int(msg.get("create_time", "0") or "0")
+                            sender_type = msg.get("sender", {}).get("sender_type", "")
+
+                            # Skip bot's own messages
+                            if sender_type == "app":
+                                continue
+
+                            # NOTE: Do NOT call _is_duplicate here!
+                            # _handle_message_event_data already does dedup.
+                            # Calling it here would add to the cache, causing
+                            # the handler to see it as a duplicate and drop it.
+
+                            # Update high-water mark
+                            if create_time > self._polling_chats.get(chat_id, 0):
+                                self._polling_chats[chat_id] = create_time
+
+                            # Construct synthetic event payload matching Feishu event format.
+                            # Feishu event: message.content (string), message.message_type
+                            # Feishu API response: message.body.content, message.msg_type
+                            # API sender: {id, id_type, sender_type}
+                            # Event sender: {sender_id: {open_id, user_id}, sender_type}
+                            raw_body = msg.get("body", {})
+                            content_str = raw_body.get("content", "") if isinstance(raw_body, dict) else ""
+                            api_sender = msg.get("sender", {})
+                            api_sender_id = api_sender.get("id", "")
+                            api_id_type = api_sender.get("id_type", "open_id")
+                            # Convert API sender to event sender format
+                            event_sender = {
+                                "sender_id": {
+                                    api_id_type: api_sender_id,
+                                    "open_id": api_sender_id if api_id_type == "open_id" else "",
+                                    "user_id": api_sender_id if api_id_type == "user_id" else "",
+                                    "union_id": api_sender_id if api_id_type == "union_id" else "",
+                                },
+                                "sender_type": api_sender.get("sender_type", "user"),
+                                "tenant_key": "",
+                            }
+                            synthetic = {
+                                "schema": "2.0",
+                                "header": {
+                                    "event_id": f"poll_{msg_id}",
+                                    "event_type": "im.message.receive_v1",
+                                    "app_id": self._app_id,
+                                },
+                                "event": {
+                                    "sender": event_sender,
+                                    "message": {
+                                        "message_id": msg_id,
+                                        "root_id": msg.get("root_id", ""),
+                                        "parent_id": msg.get("parent_id", ""),
+                                        "upper_message_id": msg.get("upper_message_id", ""),
+                                        "create_time": str(create_time),
+                                        "chat_id": chat_id,
+                                        "chat_type": msg.get("chat_type", "p2p"),
+                                        "message_type": msg.get("msg_type", "text"),
+                                        "content": content_str,
+                                    },
+                                },
+                            }
+                            event_data = self._namespace_from_mapping(synthetic)
+                            # Directly await instead of using run_coroutine_threadsafe
+                            try:
+                                await self._handle_message_event_data(event_data)
+                            except Exception as e:
+                                logger.warning("[Feishu Poll] Error processing polled message %s: %s", msg_id, e)
+                            new_count += 1
+
+                        if new_count > 0:
+                            logger.info("[Feishu Poll] Injected %d new message(s) from chat %s",
+                                       new_count, chat_id)
+                    except Exception as e:
+                        logger.debug("[Feishu Poll] Error polling chat %s: %s", chat_id, e)
+
+                # Also discover any new chats
+                await self._poll_discover_chats()
+
+                consecutive_errors = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors <= 3 or consecutive_errors % 10 == 0:
+                    logger.warning("[Feishu Poll] Error (count=%d): %s", consecutive_errors, e)
+
+            await asyncio.sleep(5)
+
+        logger.info("[Feishu Poll] Polling stopped")
 
     def _is_duplicate(self, message_id: str) -> bool:
         now = time.time()
