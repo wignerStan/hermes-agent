@@ -608,7 +608,7 @@ def _get_env_config() -> Dict[str, Any]:
     # is running inside the container/remote).
     if env_type == "local":
         default_cwd = os.getcwd()
-    elif env_type == "ssh":
+    elif env_type in ("ssh", "hpccctl"):
         default_cwd = "~"
     else:
         default_cwd = "/root"
@@ -808,8 +808,18 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "hpccctl":
+        from tools.environments.hpccctl import HpccctlEnvironment
+        return HpccctlEnvironment(
+            addr=cc.get("hpccctl_addr", "localhost:18923"),
+            wrapper=cc.get("hpccctl_wrapper", "_sif_proxy"),
+            cwd=cwd,
+            timeout=timeout,
+            cert_dir=cc.get("hpccctl_cert_dir", ""),
+        )
+
     else:
-        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', or 'ssh'")
+        raise ValueError(f"Unknown environment type: {env_type}. Use 'local', 'docker', 'singularity', 'modal', 'daytona', 'ssh', or 'hpccctl'")
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
