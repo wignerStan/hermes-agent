@@ -7,8 +7,8 @@ to the container agent via UDS — no host-side execution.
 Container agent shell is zsh. container-zshenv provides PATH, mirrors,
 SLURM, proxy env automatically. No wrapper functions, no manual sourcing.
 
-File sync: rclone for small files (bidirectional, .rcloneignore filtered).
-hpccctl push/pull (rsync over tunnel) for large files on demand.
+File sync (optional): composes with SSHEnvironment for tar-over-SSH transport
+via FileSyncManager.  Disabled when SSH params are not provided.
 """
 
 import logging
@@ -17,6 +17,7 @@ import shutil
 import subprocess
 
 from tools.environments.base import BaseEnvironment, _popen_bash
+from tools.environments.ssh import SSHEnvironment
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,9 @@ class HpccctlEnvironment(BaseEnvironment):
     def __init__(self, addr: str = "127.0.0.1:18923",
                  relay: bool = True,
                  cwd: str = "~", timeout: int = 180,
-                 config_path: str = ""):
+                 config_path: str = "",
+                 ssh_host: str = "", ssh_user: str = "",
+                 ssh_port: int = 22, ssh_key_path: str = ""):
         self.addr = addr
         self.relay = relay
         self.config_path = config_path or os.path.expanduser(
@@ -55,6 +58,24 @@ class HpccctlEnvironment(BaseEnvironment):
 
         self._ping()
         self.init_session()
+
+        # Optional SSH file sync — composes with SSHEnvironment for transport.
+        self._ssh_env: SSHEnvironment | None = None
+        self._sync_manager = None
+        if ssh_host and ssh_user:
+            logger.info(
+                "hpccctl: enabling SSH file sync to %s@%s:%s",
+                ssh_user, ssh_host, ssh_port,
+            )
+            self._ssh_env = SSHEnvironment(
+                host=ssh_host,
+                user=ssh_user,
+                port=ssh_port,
+                key_path=ssh_key_path,
+                cwd=cwd,
+                timeout=timeout,
+            )
+            self._sync_manager = self._ssh_env._sync_manager
 
     def _base_flags(self) -> list:
         """Common hpccctl flags (addr, config)."""
@@ -101,12 +122,23 @@ class HpccctlEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data)
 
     def _before_execute(self) -> None:
-        """Sync small files via rclone before each command execution."""
-        # rclone bidirectional sync is handled externally (sync-watch.sh)
-        pass
+        """Sync files to remote via SSH before each command execution."""
+        if self._sync_manager:
+            self._sync_manager.sync()
 
     def cleanup(self):
-        """Remove session directory and close."""
+        """Sync files back, close SSH connection, and remove session directory."""
+        if self._sync_manager:
+            try:
+                logger.info("hpccctl: syncing files back from remote...")
+                self._sync_manager.sync_back()
+            except Exception:
+                pass
+        if self._ssh_env:
+            try:
+                self._ssh_env.cleanup()
+            except Exception:
+                pass
         try:
             self.execute(f"rm -rf {self._session_dir}", timeout=5)
         except Exception:

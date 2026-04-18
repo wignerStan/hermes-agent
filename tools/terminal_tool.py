@@ -661,6 +661,11 @@ def _get_env_config() -> Dict[str, Any]:
         "hpccctl_addr": os.getenv("TERMINAL_HPCCCTL_ADDR", "127.0.0.1:18923"),
         "hpccctl_relay": os.getenv("TERMINAL_HPCCCTL_RELAY", "true").lower() in ("true", "1", "yes"),
         "hpccctl_config": os.getenv("TERMINAL_HPCCCTL_CONFIG", "~/.config/hpccctl/client-config.json"),
+        # HPCCCTL-SSH file sync config
+        "hpccctl_ssh_host": os.getenv("TERMINAL_HPCCCTL_SSH_HOST", ""),
+        "hpccctl_ssh_user": os.getenv("TERMINAL_HPCCCTL_SSH_USER", ""),
+        "hpccctl_ssh_port": _parse_env_var("TERMINAL_HPCCCTL_SSH_PORT", "22"),
+        "hpccctl_ssh_key": os.getenv("TERMINAL_HPCCCTL_SSH_KEY", ""),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -689,7 +694,7 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
-                        local_config: dict = None,
+                        local_config: dict = None, hpccctl_config: dict = None,
                         task_id: str = "default",
                         host_cwd: str = None):
     """
@@ -814,12 +819,17 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
     elif env_type == "hpccctl":
         from tools.environments.hpccctl import HpccctlEnvironment
+        hc = hpccctl_config or {}
         return HpccctlEnvironment(
-            addr=cc.get("hpccctl_addr", "127.0.0.1:18923"),
-            relay=cc.get("hpccctl_relay", True),
+            addr=hc.get("hpccctl_addr", "127.0.0.1:18923"),
+            relay=hc.get("hpccctl_relay", True),
             cwd=cwd,
             timeout=timeout,
-            config_path=cc.get("hpccctl_config", "~/.config/hpccctl/client-config.json"),
+            config_path=hc.get("hpccctl_config", "~/.config/hpccctl/client-config.json"),
+            ssh_host=hc.get("hpccctl_ssh_host", ""),
+            ssh_user=hc.get("hpccctl_ssh_user", ""),
+            ssh_port=int(hc.get("hpccctl_ssh_port", 22)),
+            ssh_key_path=hc.get("hpccctl_ssh_key", ""),
         )
 
     else:
@@ -1272,6 +1282,18 @@ def terminal_tool(
                                 "persistent": config.get("local_persistent", False),
                             }
 
+                        hpccctl_config = None
+                        if env_type == "hpccctl":
+                            hpccctl_config = {
+                                "hpccctl_addr": config.get("hpccctl_addr", "127.0.0.1:18923"),
+                                "hpccctl_relay": config.get("hpccctl_relay", True),
+                                "hpccctl_config": config.get("hpccctl_config", "~/.config/hpccctl/client-config.json"),
+                                "hpccctl_ssh_host": config.get("hpccctl_ssh_host", ""),
+                                "hpccctl_ssh_user": config.get("hpccctl_ssh_user", ""),
+                                "hpccctl_ssh_port": config.get("hpccctl_ssh_port", 22),
+                                "hpccctl_ssh_key": config.get("hpccctl_ssh_key", ""),
+                            }
+
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
@@ -1280,6 +1302,7 @@ def terminal_tool(
                             ssh_config=ssh_config,
                             container_config=container_config,
                             local_config=local_config,
+                            hpccctl_config=hpccctl_config,
                             task_id=effective_task_id,
                             host_cwd=config.get("host_cwd"),
                         )
@@ -1646,6 +1669,11 @@ def check_terminal_requirements() -> bool:
             if not executable:
                 logger.error("hpccctl backend selected but 'hpccctl' not found in PATH")
                 return False
+            if not os.getenv("TERMINAL_HPCCCTL_SSH_HOST"):
+                logger.warning(
+                    "hpccctl: no SSH file sync params (TERMINAL_HPCCCTL_SSH_HOST/USER) "
+                    "-- file sync disabled"
+                )
             return True
 
         else:
