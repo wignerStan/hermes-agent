@@ -106,5 +106,8 @@ class HpccctlEnvironment(BaseEnvironment):
         pass
 
     def cleanup(self):
-        """No persistent connection to close."""
-        pass
+        """Remove session directory and close."""
+        try:
+            self.execute(f"rm -rf {self._session_dir}", timeout=5)
+        except Exception:
+            pass

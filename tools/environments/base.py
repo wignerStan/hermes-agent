@@ -292,8 +292,9 @@ class BaseEnvironment(ABC):
 
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
-        self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
-        self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
+        self._session_dir = f"{temp_dir}/hermes-{self._session_id}"
+        self._snapshot_path = f"{self._session_dir}/snap.sh"
+        self._cwd_file = f"{self._session_dir}/cwd.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
 
@@ -332,18 +333,17 @@ class BaseEnvironment(ABC):
         ``_snapshot_ready = True`` so subsequent commands source the snapshot
         instead of running with ``bash -l``.
         """
-        # Full capture: env vars, functions (filtered), aliases, shell options.
-        # Restrict permissions — /tmp is shared on multi-user systems (HPC).
+        # Shell-agnostic session capture (works in both bash and zsh).
+        # Per-session dir (mode 700) secures all artifacts on shared /tmp.
         bootstrap = (
+            f"mkdir -m 700 {self._session_dir}\n"
             f"export -p > {self._snapshot_path}\n"
-            f"declare -f | grep -vE '^_[^_]' >> {self._snapshot_path}\n"
-            f"alias -p >> {self._snapshot_path}\n"
-            f"echo 'shopt -s expand_aliases' >> {self._snapshot_path}\n"
+            f"type declare >/dev/null 2>&1 && declare -f >> {self._snapshot_path} || true\n"
+            f"alias >> {self._snapshot_path} 2>/dev/null || true\n"
+            f"type shopt >/dev/null 2>&1 && echo 'shopt -s expand_aliases' >> {self._snapshot_path} || true\n"
             f"echo 'set +e' >> {self._snapshot_path}\n"
             f"echo 'set +u' >> {self._snapshot_path}\n"
-            f"chmod 600 {self._snapshot_path}\n"
             f"pwd -P > {self._cwd_file} 2>/dev/null || true\n"
-            f"chmod 600 {self._cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
@@ -393,11 +393,9 @@ class BaseEnvironment(ABC):
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
             parts.append(f"export -p > {self._snapshot_path} 2>/dev/null || true")
-            parts.append(f"chmod 600 {self._snapshot_path} 2>/dev/null || true")
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
         parts.append(f"pwd -P > {self._cwd_file} 2>/dev/null || true")
-        parts.append(f"chmod 600 {self._cwd_file} 2>/dev/null || true")
         # Use a distinct line for the marker. The leading \n ensures
         # the marker starts on its own line even if the command doesn't
         # end with a newline (e.g. printf 'exact'). We'll strip this
