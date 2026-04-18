@@ -657,6 +657,10 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        # HPCCCTL-specific config
+        "hpccctl_addr": os.getenv("TERMINAL_HPCCCTL_ADDR", "127.0.0.1:18923"),
+        "hpccctl_relay": os.getenv("TERMINAL_HPCCCTL_RELAY", "true").lower() in ("true", "1", "yes"),
+        "hpccctl_config": os.getenv("TERMINAL_HPCCCTL_CONFIG", "~/.config/hpccctl/client-config.json"),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -811,11 +815,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     elif env_type == "hpccctl":
         from tools.environments.hpccctl import HpccctlEnvironment
         return HpccctlEnvironment(
-            addr=cc.get("hpccctl_addr", "localhost:18923"),
-            wrapper=cc.get("hpccctl_wrapper", "_sif_proxy"),
+            addr=cc.get("hpccctl_addr", "127.0.0.1:18923"),
+            relay=cc.get("hpccctl_relay", True),
             cwd=cwd,
             timeout=timeout,
-            cert_dir=cc.get("hpccctl_cert_dir", ""),
+            config_path=cc.get("hpccctl_config", "~/.config/hpccctl/client-config.json"),
         )
 
     else:
@@ -1637,10 +1641,17 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
+        elif env_type == "hpccctl":
+            executable = shutil.which("hpccctl")
+            if not executable:
+                logger.error("hpccctl backend selected but 'hpccctl' not found in PATH")
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, ssh, hpccctl.",
                 env_type,
             )
             return False

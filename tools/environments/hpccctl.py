@@ -1,19 +1,14 @@
-"""hpccctl remote execution environment — mTLS docker-exec-style command execution.
+"""hpccctl remote execution environment — mTLS relay to container agent.
 
-Uses hpccctl (Go binary) to execute commands on HPC via mTLS.
-No SSH, no DPI detection. hpccagent runs on HPC, accepts commands
-over TLS with client certificate auth.
+Uses hpccctl (Go binary) to relay commands to a UDS agent running inside
+a persistent Apptainer container on HPC. The TLS agent forwards raw bytes
+to the container agent via UDS — no host-side execution.
 
-hpccagent uses emulator style: ``shell -c "wrapperFunc cmd"``.
-No nested ``bash -c`` — the cmd string is the shell script directly.
-Wrapper functions (_sif_proxy, etc.) are defined in cal-bashrc.
+Container agent shell is zsh. container-zshenv provides PATH, mirrors,
+SLURM, proxy env automatically. No wrapper functions, no manual sourcing.
 
 File sync: rclone for small files (bidirectional, .rcloneignore filtered).
 hpccctl push/pull (rsync over tunnel) for large files on demand.
-
-Spawn-per-call: every execute() spawns ``hpccctl exec --wrapper ... CMD``
-Session snapshot preserves env vars across calls on remote host.
-CWD persists via in-band stdout markers.
 """
 
 import logging
@@ -30,48 +25,42 @@ def _ensure_hpccctl_available() -> None:
     if not shutil.which("hpccctl"):
         raise RuntimeError(
             "hpccctl is not installed or not in PATH. "
-            "Build from ~/academic/hpccctl/ and install to ~/local/bin/"
+            "Build from ~/academic/hpccctl/ and install to ~/.local/bin/"
         )
 
 
 class HpccctlEnvironment(BaseEnvironment):
-    """Run commands on HPC via hpccctl (mTLS docker-exec-style).
+    """Run commands inside HPC container via hpccctl relay mode.
 
-    hpccagent runs on the HPC host (cal), listening on port 18923.
-    hpccctl connects via mTLS and executes commands inside the container
-    using a shell wrapper function (e.g. _sif_proxy from cal-bashrc).
-
-    This replaces the singularity underlay backend — no fragile bind mount
-    management, no proxy injection, no zsh config patches. The wrapper
-    function handles all of that natively.
+    TLS agent on cal (host) relays raw bytes to UDS agent inside
+    the Apptainer container. Commands execute directly in the container
+    environment — zsh shell, container-zshenv sourced automatically.
     """
 
-    def __init__(self, addr: str = "localhost:18923",
-                 wrapper: str = "_sif_proxy",
+    def __init__(self, addr: str = "127.0.0.1:18923",
+                 relay: bool = True,
                  cwd: str = "~", timeout: int = 180,
-                 cert_dir: str = ""):
-        super().__init__(cwd=cwd, timeout=timeout)
+                 config_path: str = ""):
         self.addr = addr
-        self.wrapper = wrapper
-        self.cert_dir = cert_dir or os.path.expanduser("~/.hpccctl/certs")
+        self.relay = relay
+        self.config_path = config_path or os.path.expanduser(
+            "~/.config/hpccctl/client-config.json"
+        )
+        self._remote_tmp = "/tmp"
 
         _ensure_hpccctl_available()
         self._hpccctl_bin = shutil.which("hpccctl")
 
-        # Verify connectivity
-        self._ping()
+        super().__init__(cwd=cwd, timeout=timeout)
 
-        # Session snapshot on remote host
-        self._remote_tmp = "/tmp"
+        self._ping()
         self.init_session()
 
     def _base_flags(self) -> list:
-        """Common hpccctl flags (addr, certs, wrapper)."""
+        """Common hpccctl flags (addr, config)."""
         cmd = ["--addr", self.addr]
-        if self.cert_dir:
-            cmd.extend(["--cert-dir", self.cert_dir])
-        if self.wrapper:
-            cmd.extend(["--wrapper", self.wrapper])
+        if self.config_path:
+            cmd.extend(["--config", self.config_path])
         return cmd
 
     def _ping(self) -> None:
@@ -98,24 +87,22 @@ class HpccctlEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn hpccctl exec process.
 
-        Emulator style: cmd_string is passed directly as the shell script.
-        hpccagent builds: ``shell -c "wrapperFunc cmd_string"``.
-        No nested ``bash -c`` — avoids quoting/parse issues.
+        Uses --relay to forward command to container agent via UDS.
+        Container agent runs zsh -c inside the Apptainer container.
+        container-zshenv sourced automatically — no wrapper needed.
         """
         cmd = [self._hpccctl_bin, "exec",
                "--timeout", str(timeout)]
         cmd.extend(self._base_flags())
-        # cmd_string is the raw shell script — hpccagent wraps it:
-        # shell -c "_sif_proxy <cmd_string>" (if wrapper set)
-        # shell -c "<cmd_string>" (if no wrapper)
-        cmd.append(cmd_string)
+        if self.relay:
+            cmd.append("--relay")
+        cmd.extend(["--cmd", cmd_string])
 
         return _popen_bash(cmd, stdin_data)
 
     def _before_execute(self) -> None:
         """Sync small files via rclone before each command execution."""
         # rclone bidirectional sync is handled externally (sync-watch.sh)
-        # or can be triggered here for on-demand sync.
         pass
 
     def cleanup(self):

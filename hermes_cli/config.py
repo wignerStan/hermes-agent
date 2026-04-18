@@ -3392,7 +3392,11 @@ def show_config():
         ssh_user = get_env_value('TERMINAL_SSH_USER')
         print(f"  SSH host:     {ssh_host or '(not set)'}")
         print(f"  SSH user:     {ssh_user or '(not set)'}")
-    
+    elif terminal.get('backend') == 'hpccctl':
+        print(f"  hpccctl addr:   {terminal.get('hpccctl_addr', '127.0.0.1:18923')}")
+        print(f"  hpccctl relay:  {terminal.get('hpccctl_relay', True)}")
+        print(f"  hpccctl config: {terminal.get('hpccctl_config', '~/.config/hpccctl/client-config.json')}")
+
     # Timezone
     print()
     print(color("◆ Timezone", Colors.CYAN, Colors.BOLD))
