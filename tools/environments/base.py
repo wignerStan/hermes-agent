@@ -333,6 +333,7 @@ class BaseEnvironment(ABC):
         instead of running with ``bash -l``.
         """
         # Full capture: env vars, functions (filtered), aliases, shell options.
+        # Restrict permissions — /tmp is shared on multi-user systems (HPC).
         bootstrap = (
             f"export -p > {self._snapshot_path}\n"
             f"declare -f | grep -vE '^_[^_]' >> {self._snapshot_path}\n"
@@ -340,7 +341,9 @@ class BaseEnvironment(ABC):
             f"echo 'shopt -s expand_aliases' >> {self._snapshot_path}\n"
             f"echo 'set +e' >> {self._snapshot_path}\n"
             f"echo 'set +u' >> {self._snapshot_path}\n"
+            f"chmod 600 {self._snapshot_path}\n"
             f"pwd -P > {self._cwd_file} 2>/dev/null || true\n"
+            f"chmod 600 {self._cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
@@ -390,9 +393,11 @@ class BaseEnvironment(ABC):
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
         if self._snapshot_ready:
             parts.append(f"export -p > {self._snapshot_path} 2>/dev/null || true")
+            parts.append(f"chmod 600 {self._snapshot_path} 2>/dev/null || true")
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)
         parts.append(f"pwd -P > {self._cwd_file} 2>/dev/null || true")
+        parts.append(f"chmod 600 {self._cwd_file} 2>/dev/null || true")
         # Use a distinct line for the marker. The leading \n ensures
         # the marker starts on its own line even if the command doesn't
         # end with a newline (e.g. printf 'exact'). We'll strip this

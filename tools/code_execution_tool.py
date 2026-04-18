@@ -757,9 +757,10 @@ def _execute_remote(
                 "duration_seconds": 0,
             })
 
-        # Create sandbox directory on remote
+        # Create sandbox directory on remote (restricted — /tmp is shared on HPC)
         env.execute(
-            f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10,
+            f"mkdir -p {quoted_rpc_dir} && chmod 700 {shlex.quote(sandbox_dir)}",
+            cwd="/", timeout=10,
         )
 
         # Generate and ship files
