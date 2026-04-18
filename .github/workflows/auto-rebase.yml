@@ -1,0 +1,130 @@
+name: Auto-rebase feature branches from upstream
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Feature branch to rebase (default: all tracked branches)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  # Branches to auto-rebase from upstream main.
+  # Add feature branches here.
+  TRACKED_BRANCHES: |
+    feat/hpccctl-backend
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --quiet
+
+      - name: Determine branches
+        id: branches
+        run: |
+          if [ -n "${{ inputs.branch }}" ]; then
+            echo "branches=${{ inputs.branch }}" >> "$GITHUB_OUTPUT"
+          else
+            # Read TRACKED_BRANCHES, join with spaces
+            BRANCHES=$(echo "$TRACKED_BRANCHES" | grep -v '^$' | tr '\n' ' ' | xargs)
+            echo "branches=$BRANCHES" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase tracked branches
+        run: |
+          UPSTREAM="upstream/main"
+          git log --oneline "$UPSTREAM" -1
+
+          for BRANCH in ${{ steps.branches.outputs.branches }}; do
+            echo "=== Rebasing $BRANCH onto $UPSTREAM ==="
+
+            # Check if branch exists
+            if ! git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+              echo "SKIP: branch $BRANCH not found"
+              continue
+            fi
+
+            git checkout "$BRANCH"
+
+            # Count commits ahead of merge-base
+            AHEAD=$(git rev-list --count "upstream/main..$BRANCH")
+            if [ "$AHEAD" -eq 0 ]; then
+              echo "SKIP: $BRANCH has no commits ahead of upstream"
+              continue
+            fi
+            echo "$BRANCH is $AHEAD commits ahead of merge-base"
+
+            # Attempt rebase
+            if git rebase "$UPSTREAM" --no-autosquash 2>&1; then
+              echo "OK: rebase clean, force-pushing"
+              git push fork "$BRANCH" --force-with-lease
+            else
+              echo "CONFLICT: rebase failed"
+              git rebase --abort 2>/dev/null || true
+
+              # Collect conflict details
+              CONFLICT_FILES=""
+              MERGE_BASE=$(git merge-base "$UPSTREAM" "$BRANCH")
+              CONFLICTING=$(git diff --name-only --diff-filter=U "$MERGE_BASE" "$BRANCH" "$UPSTREAM" 2>/dev/null || true)
+              if [ -n "$CONFLICTING" ]; then
+                CONFLICT_FILES="$CONFLICTING"
+              fi
+
+              # Create issue for manual rebase
+              TITLE="auto-rebase: conflicts on $BRANCH"
+              BODY="Automatic rebase of \`$BRANCH\` onto \`upstream/main\` failed due to conflicts.
+
+              Conflicting files:
+              \`\`\`
+              $CONFLICT_FILES
+              \`\`\`
+
+              Upstream HEAD: $(git rev-parse --short "$UPSTREAM")
+              Branch HEAD: $(git rev-parse --short "$BRANCH")
+
+              To resolve manually:
+              \`\`\`bash
+              git fetch upstream
+              git checkout $BRANCH
+              git rebase upstream/main
+              # resolve conflicts...
+              git rebase --continue
+              git push fork $BRANCH --force-with-lease
+              \`\`\`"
+
+              # Check if issue already exists
+              EXISTING=$(gh issue list --state open --search "auto-rebase: conflicts on $BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+              if [ -n "$EXISTING" ]; then
+                echo "Issue #$EXISTING already exists, updating..."
+                gh issue comment "$EXISTING" --body "Still conflicting as of $(date -u +%Y-%m-%d). Upstream: $(git rev-parse --short $UPSTREAM)"
+              else
+                gh issue create --title "$TITLE" --body "$BODY" --label "rebase-conflict" 2>/dev/null || \
+                gh issue create --title "$TITLE" --body "$BODY"
+              fi
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
